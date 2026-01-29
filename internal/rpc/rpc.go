@@ -3,6 +3,7 @@ package rpc
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/tmc/nlm/internal/batchexecute"
@@ -19,7 +20,7 @@ const (
 	RPCRemoveRecentlyViewed       = "fejl7e" // RemoveRecentlyViewedProject
 
 	// NotebookLM service - Source operations
-	RPCAddSources           = "izAoDd" // AddSources
+	RPCAddSources           = "o4cbdc" // AddSources
 	RPCDeleteSources        = "tGMBJ"  // DeleteSources
 	RPCMutateSource         = "b7Wfje" // MutateSource
 	RPCRefreshSource        = "FLmJqe" // RefreshSource
@@ -103,6 +104,18 @@ type Client struct {
 // New creates a new NotebookLM RPC client
 // New creates a new NotebookLM RPC client
 func New(authToken, cookies string, options ...batchexecute.Option) *Client {
+	bl := os.Getenv("NLM_BL")
+	if bl == "" {
+		bl = "boq_labs-tailwind-frontend_20260127.09_p1"
+	}
+	fsid := os.Getenv("NLM_F_SID")
+	if fsid == "" {
+		fsid = "3894541541181659848"
+	}
+	hl := os.Getenv("NLM_HL")
+	if hl == "" {
+		hl = "en"
+	}
 	config := batchexecute.Config{
 		Host:      "notebooklm.google.com",
 		App:       "LabsTailwindUi",
@@ -119,17 +132,17 @@ func New(authToken, cookies string, options ...batchexecute.Option) *Client {
 			"pragma":          "no-cache",
 		},
 		URLParams: map[string]string{
-			// Update to January 2025 build version
-			"bl":    "boq_labs-tailwind-frontend_20250129.00_p0",
-			"f.sid": "-7121977511756781186",
-			"hl":    "en",
+			"bl":    bl,
+			"f.sid": fsid,
+			"hl":    hl,
 			// Omit rt parameter for JSON array format (easier to parse)
 			// "rt":    "c",  // Use "c" for chunked format, omit for JSON array
 		},
 	}
+	bc := batchexecute.NewClient(config, options...)
 	return &Client{
-		Config: config,
-		client: batchexecute.NewClient(config, options...),
+		Config: bc.Config(),
+		client: bc,
 	}
 }
 

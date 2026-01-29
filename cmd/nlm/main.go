@@ -167,6 +167,9 @@ func main() {
 
 	// Load stored environment variables
 	loadStoredEnv()
+	if debug {
+		os.Setenv("NLM_DEBUG", "true")
+	}
 
 	// Set skip sources flag if specified
 	if skipSources {

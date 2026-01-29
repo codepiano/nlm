@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"mime"
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
+	filepathpkg "path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -266,7 +268,7 @@ func detectMIMEType(content []byte, filename string, providedType string) string
 	}
 
 	// Try extension-based detection
-	ext := filepath.Ext(filename)
+	ext := filepathpkg.Ext(filename)
 	if ext != "" {
 		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
 			return mimeType
@@ -308,8 +310,7 @@ func (c *Client) AddSourceFromReader(projectID string, r io.Reader, filename str
 		return c.AddSourceFromText(projectID, string(content), filename)
 	}
 
-	encoded := base64.StdEncoding.EncodeToString(content)
-	return c.AddSourceFromBase64(projectID, encoded, filename, detectedType)
+	return c.AddSourceFromUpload(projectID, content, filename, detectedType)
 }
 
 func (c *Client) AddSourceFromText(projectID string, content, title string) (string, error) {
@@ -349,8 +350,8 @@ func (c *Client) AddSourceFromBase64(projectID string, content, filename, conten
 		Args: []interface{}{
 			[]interface{}{
 				[]interface{}{
-					content,
 					filename,
+					content,
 					contentType,
 					"base64",
 				},
@@ -380,7 +381,157 @@ func (c *Client) AddSourceFromFile(projectID string, filepath string, contentTyp
 	if len(contentType) > 0 {
 		providedType = contentType[0]
 	}
-	return c.AddSourceFromReader(projectID, f, filepath, providedType)
+	return c.AddSourceFromReader(projectID, f, filepathpkg.Base(filepath), providedType)
+}
+
+func (c *Client) AddSourceFromUpload(notebookID string, content []byte, filename string, contentType string) (string, error) {
+	projectID := os.Getenv("NLM_PROJECT_ID")
+	if projectID == "" {
+		projectID = notebookID
+	}
+
+	sourceID, err := c.createUploadSource(notebookID, projectID, filename)
+	if err != nil {
+		return "", err
+	}
+
+	uploadURL, err := c.startResumableUpload(projectID, sourceID, filename, int64(len(content)))
+	if err != nil {
+		return "", err
+	}
+
+	if err := c.uploadResumableContent(uploadURL, content, contentType); err != nil {
+		return "", err
+	}
+
+	return sourceID, nil
+}
+
+func (c *Client) createUploadSource(notebookID, projectID, filename string) (string, error) {
+	args := []interface{}{
+		[]interface{}{
+			[]interface{}{
+				filename,
+			},
+		},
+		projectID,
+		[]interface{}{2},
+		[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+	}
+	resp, err := c.rpc.Do(rpc.Call{
+		ID:         rpc.RPCAddSources,
+		NotebookID: notebookID,
+		Args:       args,
+	})
+	if err != nil {
+		return "", fmt.Errorf("create upload source: %w", err)
+	}
+	sourceID, err := extractSourceID(resp)
+	if err != nil {
+		return "", fmt.Errorf("extract source ID: %w", err)
+	}
+	return sourceID, nil
+}
+
+func (c *Client) startResumableUpload(projectID, sourceID, filename string, size int64) (string, error) {
+	authUser := os.Getenv("NLM_AUTHUSER")
+	if authUser == "" {
+		authUser = "0"
+	}
+	uploadURL := fmt.Sprintf("https://notebooklm.google.com/upload/_/?authuser=%s", url.QueryEscape(authUser))
+
+	body := map[string]string{
+		"PROJECT_ID":  projectID,
+		"SOURCE_NAME": filename,
+		"SOURCE_ID":   sourceID,
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("marshal upload start body: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", uploadURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("create upload start request: %w", err)
+	}
+
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+	req.Header.Set("Origin", "https://notebooklm.google.com")
+	req.Header.Set("Referer", "https://notebooklm.google.com/")
+	req.Header.Set("X-Goog-Upload-Command", "start")
+	req.Header.Set("X-Goog-Upload-Protocol", "resumable")
+	req.Header.Set("X-Goog-Upload-Header-Content-Length", strconv.FormatInt(size, 10))
+	req.Header.Set("X-Goog-AuthUser", authUser)
+
+	if c.rpc != nil {
+		if c.rpc.Config.Cookies != "" {
+			req.Header.Set("Cookie", c.rpc.Config.Cookies)
+		}
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload start request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := ioutil.ReadAll(resp.Body)
+		return "", fmt.Errorf("upload start failed: status %s: %s", resp.Status, string(b))
+	}
+
+	uploadURL = resp.Header.Get("x-goog-upload-url")
+	if uploadURL == "" {
+		uploadURL = resp.Header.Get("x-goog-upload-control-url")
+	}
+	if uploadURL == "" {
+		return "", fmt.Errorf("upload start failed: missing upload url in response headers")
+	}
+	return uploadURL, nil
+}
+
+func (c *Client) uploadResumableContent(uploadURL string, content []byte, contentType string) error {
+	authUser := os.Getenv("NLM_AUTHUSER")
+	if authUser == "" {
+		authUser = "0"
+	}
+
+	req, err := http.NewRequest("POST", uploadURL, bytes.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("create upload request: %w", err)
+	}
+
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("Origin", "https://notebooklm.google.com")
+	req.Header.Set("Referer", "https://notebooklm.google.com/")
+	req.Header.Set("X-Goog-Upload-Command", "upload, finalize")
+	req.Header.Set("X-Goog-Upload-Offset", "0")
+	req.Header.Set("X-Goog-AuthUser", authUser)
+
+	if c.rpc != nil {
+		if c.rpc.Config.Cookies != "" {
+			req.Header.Set("Cookie", c.rpc.Config.Cookies)
+		}
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("upload failed: status %s: %s", resp.Status, string(b))
+	}
+	return nil
 }
 
 func (c *Client) AddSourceFromURL(projectID string, url string) (string, error) {
